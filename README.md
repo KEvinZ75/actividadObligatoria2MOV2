@@ -1,6 +1,7 @@
 # mi_agenda
 
-A new Flutter project.
+Usuario: admin@agenda.com
+contrasena: 1234
 
 ## Getting Started
 
