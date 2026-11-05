@@ -1,17 +1,31 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:path/path.dart' show join;
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:url_launcher/url_launcher.dart';
 
-void main() {
+const claveAutenticado = 'autenticado';
+
+Uri telUri(String telefono) =>
+    Uri(scheme: 'tel', path: telefono.replaceAll(RegExp(r'[^\d+]'), ''));
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
   runApp(
     ChangeNotifierProvider(
-      create: (_) => ContactosProvider(),
-      child: const MiAgendaApp(),
+      create: (_) => ContactosProvider()..cargar(),
+      child: MiAgendaApp(autenticado: prefs.getBool(claveAutenticado) ?? false),
     ),
   );
 }
 
 class MiAgendaApp extends StatelessWidget {
-  const MiAgendaApp({super.key});
+  final bool autenticado;
+
+  const MiAgendaApp({super.key, required this.autenticado});
 
   @override
   Widget build(BuildContext context) {
@@ -19,11 +33,13 @@ class MiAgendaApp extends StatelessWidget {
       title: 'Mi Agenda',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true),
-      initialRoute: '/',
+      home: autenticado ? const ContactosScreen() : const LoginScreen(),
       routes: {
-        '/': (_) => const LoginScreen(),
+        '/login': (_) => const LoginScreen(),
         '/contactos': (_) => const ContactosScreen(),
-        '/agregar': (_) => const AgregarContactoScreen(),
+        '/agregar': (ctx) => AgregarContactoScreen(
+              contacto: ModalRoute.of(ctx)!.settings.arguments as Contacto?,
+            ),
       },
     );
   }
@@ -31,6 +47,7 @@ class MiAgendaApp extends StatelessWidget {
 
 
 class Contacto {
+  final int? id;
   final String nombre;
   final String apellido;
   final String telefono;
@@ -40,6 +57,7 @@ class Contacto {
   final String genero;
 
   Contacto({
+    this.id,
     required this.nombre,
     required this.apellido,
     required this.telefono,
@@ -50,16 +68,75 @@ class Contacto {
   });
 
   String get nombreCompleto => '$nombre $apellido';
+
+  factory Contacto.fromMap(Map<String, Object?> m) => Contacto(
+        id: m['id'] as int,
+        nombre: m['nombre'] as String,
+        apellido: m['apellido'] as String,
+        telefono: m['telefono'] as String,
+        email: m['email'] as String,
+        domicilio: m['domicilio'] as String,
+        fechaNacimiento: DateTime.tryParse(m['fecha_nacimiento'] as String? ?? ''),
+        genero: m['genero'] as String,
+      );
+
+  Map<String, Object?> toMap() => {
+        'nombre': nombre,
+        'apellido': apellido,
+        'telefono': telefono,
+        'email': email,
+        'domicilio': domicilio,
+        'fecha_nacimiento': fechaNacimiento?.toIso8601String(),
+        'genero': genero,
+      };
 }
 
 class ContactosProvider extends ChangeNotifier {
-  final List<Contacto> _contactos = [];
+  List<Contacto> _contactos = [];
 
   List<Contacto> get contactos => List.unmodifiable(_contactos);
 
-  void agregar(Contacto c) {
-    _contactos.add(c);
+  Future<Database> _abrir() async => openDatabase(
+        join(await getDatabasesPath(), 'agenda.db'),
+        version: 1,
+        onCreate: (db, _) => db.execute('''
+          CREATE TABLE contactos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT NOT NULL,
+            apellido TEXT NOT NULL,
+            telefono TEXT NOT NULL,
+            email TEXT NOT NULL,
+            domicilio TEXT NOT NULL,
+            fecha_nacimiento TEXT,
+            genero TEXT NOT NULL
+          )
+        '''),
+      );
+
+  Future<void> cargar() async {
+    final db = await _abrir();
+    final filas = await db.query('contactos',
+        orderBy: 'nombre COLLATE NOCASE, apellido COLLATE NOCASE');
+    _contactos = filas.map(Contacto.fromMap).toList();
     notifyListeners();
+  }
+
+  Future<void> agregar(Contacto c) async {
+    final db = await _abrir();
+    await db.insert('contactos', c.toMap());
+    await cargar();
+  }
+
+  Future<void> actualizar(Contacto c) async {
+    final db = await _abrir();
+    await db.update('contactos', c.toMap(), where: 'id = ?', whereArgs: [c.id]);
+    await cargar();
+  }
+
+  Future<void> eliminar(int id) async {
+    final db = await _abrir();
+    await db.delete('contactos', where: 'id = ?', whereArgs: [id]);
+    await cargar();
   }
 
   List<Contacto> filtrar(String texto) {
@@ -89,11 +166,13 @@ class _LoginScreenState extends State<LoginScreen> {
   static const _usuarioValido = 'admin@agenda.com';
   static const _passValida = '1234';
 
-  void _iniciarSesion() {
+  Future<void> _iniciarSesion() async {
     if (!_formKey.currentState!.validate()) return;
     if (_usuarioCtrl.text.trim() == _usuarioValido &&
         _passCtrl.text == _passValida) {
-      Navigator.pushReplacementNamed(context, '/contactos');
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(claveAutenticado, true);
+      if (mounted) Navigator.pushReplacementNamed(context, '/contactos');
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Usuario o contraseña incorrectos')),
@@ -179,6 +258,26 @@ class _ContactosScreenState extends State<ContactosScreen> {
     });
   }
 
+  Future<void> _cerrarSesion() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(claveAutenticado, false);
+    if (mounted) Navigator.pushReplacementNamed(context, '/login');
+  }
+
+  Future<void> _llamar(String telefono) async {
+    bool abierto;
+    try {
+      abierto = await launchUrl(telUri(telefono));
+    } on PlatformException {
+      abierto = false;
+    }
+    if (!abierto && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No se pudo abrir la app de teléfono')),
+      );
+    }
+  }
+
   @override
   void dispose() {
     _busquedaCtrl.dispose();
@@ -215,7 +314,7 @@ class _ContactosScreenState extends State<ContactosScreen> {
               onPressed: () => setState(() => _buscando = true),
             ),
           PopupMenuButton<String>(
-            onSelected: (_) => Navigator.pushReplacementNamed(context, '/'),
+            onSelected: (_) => _cerrarSesion(),
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'salir', child: Text('Cerrar sesión')),
             ],
@@ -248,7 +347,12 @@ class _ContactosScreenState extends State<ContactosScreen> {
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(fontWeight: FontWeight.bold)),
                   subtitle: Text(c.telefono),
-                  trailing: const Icon(Icons.phone, color: Colors.green),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.phone, color: Colors.green),
+                    tooltip: 'Llamar',
+                    onPressed: () => _llamar(c.telefono),
+                  ),
+                  onTap: () => Navigator.pushNamed(context, '/agregar', arguments: c),
                 );
               },
             ),
@@ -261,7 +365,9 @@ class _ContactosScreenState extends State<ContactosScreen> {
 }
 
 class AgregarContactoScreen extends StatefulWidget {
-  const AgregarContactoScreen({super.key});
+  final Contacto? contacto;
+
+  const AgregarContactoScreen({super.key, this.contacto});
 
   @override
   State<AgregarContactoScreen> createState() => _AgregarContactoScreenState();
@@ -269,13 +375,13 @@ class AgregarContactoScreen extends StatefulWidget {
 
 class _AgregarContactoScreenState extends State<AgregarContactoScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _nombreCtrl = TextEditingController();
-  final _apellidoCtrl = TextEditingController();
-  final _telefonoCtrl = TextEditingController(text: '+54 ');
-  final _emailCtrl = TextEditingController();
-  final _domicilioCtrl = TextEditingController();
-  DateTime? _fechaNacimiento;
-  String _genero = 'Femenino';
+  late final _nombreCtrl = TextEditingController(text: widget.contacto?.nombre);
+  late final _apellidoCtrl = TextEditingController(text: widget.contacto?.apellido);
+  late final _telefonoCtrl = TextEditingController(text: widget.contacto?.telefono ?? '+54 ');
+  late final _emailCtrl = TextEditingController(text: widget.contacto?.email);
+  late final _domicilioCtrl = TextEditingController(text: widget.contacto?.domicilio);
+  late DateTime? _fechaNacimiento = widget.contacto?.fechaNacimiento;
+  late String _genero = widget.contacto?.genero ?? 'Femenino';
 
   Future<void> _elegirFecha() async {
     final fecha = await showDatePicker(
@@ -287,18 +393,56 @@ class _AgregarContactoScreenState extends State<AgregarContactoScreen> {
     if (fecha != null) setState(() => _fechaNacimiento = fecha);
   }
 
-  void _guardar() {
+  Future<void> _ejecutar(Future<void> Function() operacion) async {
+    try {
+      await operacion();
+      if (mounted) Navigator.pop(context);
+    } on DatabaseException {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No se pudo completar la operación')),
+        );
+      }
+    }
+  }
+
+  Future<void> _guardar() async {
     if (!_formKey.currentState!.validate()) return;
-    context.read<ContactosProvider>().agregar(Contacto(
-          nombre: _nombreCtrl.text.trim(),
-          apellido: _apellidoCtrl.text.trim(),
-          telefono: _telefonoCtrl.text.trim(),
-          email: _emailCtrl.text.trim(),
-          domicilio: _domicilioCtrl.text.trim(),
-          fechaNacimiento: _fechaNacimiento,
-          genero: _genero,
-        ));
-    Navigator.pop(context);
+    final agenda = context.read<ContactosProvider>();
+    final contacto = Contacto(
+      id: widget.contacto?.id,
+      nombre: _nombreCtrl.text.trim(),
+      apellido: _apellidoCtrl.text.trim(),
+      telefono: _telefonoCtrl.text.trim(),
+      email: _emailCtrl.text.trim(),
+      domicilio: _domicilioCtrl.text.trim(),
+      fechaNacimiento: _fechaNacimiento,
+      genero: _genero,
+    );
+    await _ejecutar(() =>
+        contacto.id == null ? agenda.agregar(contacto) : agenda.actualizar(contacto));
+  }
+
+  Future<void> _eliminar() async {
+    final agenda = context.read<ContactosProvider>();
+    final confirmado = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Eliminar contacto'),
+        content: Text('¿Eliminar a ${widget.contacto!.nombreCompleto}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Eliminar'),
+          ),
+        ],
+      ),
+    );
+    if (confirmado == true) await _ejecutar(() => agenda.eliminar(widget.contacto!.id!));
   }
 
   @override
@@ -338,8 +482,16 @@ class _AgregarContactoScreenState extends State<AgregarContactoScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Agregar'),
-        actions: [IconButton(icon: const Icon(Icons.check), onPressed: _guardar)],
+        title: Text(widget.contacto == null ? 'Agregar' : 'Editar'),
+        actions: [
+          if (widget.contacto != null)
+            IconButton(
+              icon: const Icon(Icons.delete),
+              tooltip: 'Eliminar',
+              onPressed: _eliminar,
+            ),
+          IconButton(icon: const Icon(Icons.check), tooltip: 'Guardar', onPressed: _guardar),
+        ],
       ),
       body: Form(
         key: _formKey,
